@@ -1,3 +1,2 @@
-streamlit>=1.31
-supabase>=2.0.0
-pandas>=2.0.0
+streamlit
+pandas
