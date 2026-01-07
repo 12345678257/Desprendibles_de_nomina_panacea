@@ -4,8 +4,9 @@ import io
 import base64
 import hmac
 import zipfile
-import secrets
+import secrets as pysecrets
 from datetime import datetime, date
+from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -25,10 +26,12 @@ CEDULA_RE = re.compile(r"(\d{5,})")  # Ajusta si necesitas otra regla
 # =========================
 import hashlib
 
-def hash_password(password: str, salt: bytes | None = None) -> str:
+def hash_password(password: str, salt: Optional[bytes] = None) -> str:
     if salt is None:
         salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERS, dklen=32)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PBKDF2_ITERS, dklen=32
+    )
     return f"{base64.b64encode(salt).decode()}${base64.b64encode(dk).decode()}"
 
 def verify_password(password: str, stored: str) -> bool:
@@ -36,7 +39,9 @@ def verify_password(password: str, stored: str) -> bool:
         salt_b64, dk_b64 = stored.split("$", 1)
         salt = base64.b64decode(salt_b64)
         expected = base64.b64decode(dk_b64)
-        dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ITERS, dklen=32)
+        dk = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), salt, PBKDF2_ITERS, dklen=32
+        )
         return hmac.compare_digest(dk, expected)
     except Exception:
         return False
@@ -45,7 +50,7 @@ def verify_password(password: str, stored: str) -> bool:
 # =========================
 # HELPERS
 # =========================
-def normalize_month_str(s: str) -> str | None:
+def normalize_month_str(s: str) -> Optional[str]:
     s = (s or "").strip()
     if re.fullmatch(r"\d{4}-\d{2}", s):
         yyyy, mm = s.split("-")
@@ -57,7 +62,7 @@ def normalize_month_str(s: str) -> str | None:
 def month_from_date(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
-def extract_cedula_from_filename(name: str) -> str | None:
+def extract_cedula_from_filename(name: str) -> Optional[str]:
     base = os.path.splitext(os.path.basename(name))[0]
     m = CEDULA_RE.search(base)
     return m.group(1) if m else None
@@ -96,18 +101,52 @@ def iter_zip_pdfs(zip_bytes: bytes):
 
 
 # =========================
+# SECRETS / CONFIG (ROBUSTO)
+# =========================
+def cfg_get(key: str, default: str = "") -> str:
+    """
+    Lee primero de st.secrets (Streamlit Cloud), luego de env vars.
+    """
+    try:
+        v = st.secrets.get(key, None)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    except Exception:
+        pass
+    v2 = os.getenv(key, "").strip()
+    return v2 if v2 else default
+
+def config_screen_and_stop():
+    st.title(APP_TITLE)
+    st.error("Faltan credenciales de Supabase para iniciar la app.")
+
+    st.markdown("### Cómo solucionarlo (Streamlit Community Cloud)")
+    st.write("1) Abre tu app → Settings → Secrets")
+    st.write("2) Pega esto y guarda:")
+    st.code(
+        'SUPABASE_URL = "https://TU-PROYECTO.supabase.co"\n'
+        'SUPABASE_SERVICE_ROLE_KEY = "TU_SERVICE_ROLE_KEY"\n'
+        'SUPABASE_BUCKET = "desprendibles"\n',
+        language="toml"
+    )
+    st.info("Después usa Reboot app. No subas secrets.toml al repositorio.")
+    st.stop()
+
+
+# =========================
 # SUPABASE
 # =========================
 @st.cache_resource
 def sb_client():
-    url = st.secrets.get("SUPABASE_URL", "")
-    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    url = cfg_get("SUPABASE_URL")
+    key = cfg_get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
-        raise RuntimeError("Faltan SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY en Secrets.")
+        # En vez de reventar con RuntimeError, mostramos pantalla guiada
+        config_screen_and_stop()
     return create_client(url, key)
 
 def sb_bucket() -> str:
-    return st.secrets.get("SUPABASE_BUCKET", "desprendibles")
+    return cfg_get("SUPABASE_BUCKET", "desprendibles")
 
 def sb_storage():
     return sb_client().storage.from_(sb_bucket())
@@ -121,7 +160,9 @@ def user_exists_admin() -> bool:
 
 def get_user(cedula: str):
     sb = sb_client()
-    resp = sb.table("users").select("cedula,full_name,password_hash,role,is_active").eq("cedula", cedula).limit(1).execute()
+    resp = sb.table("users").select(
+        "cedula,full_name,password_hash,role,is_active"
+    ).eq("cedula", cedula).limit(1).execute()
     return resp.data[0] if resp.data else None
 
 def create_user(cedula: str, full_name: str, password: str, role: str = "user", is_active: bool = True):
@@ -136,15 +177,21 @@ def create_user(cedula: str, full_name: str, password: str, role: str = "user", 
 
 def set_user_password(cedula: str, new_password: str):
     sb = sb_client()
-    sb.table("users").update({"password_hash": hash_password(new_password)}).eq("cedula", cedula).execute()
+    sb.table("users").update({
+        "password_hash": hash_password(new_password)
+    }).eq("cedula", cedula).execute()
 
 def set_user_active(cedula: str, is_active: bool):
     sb = sb_client()
-    sb.table("users").update({"is_active": is_active}).eq("cedula", cedula).execute()
+    sb.table("users").update({
+        "is_active": is_active
+    }).eq("cedula", cedula).execute()
 
 def list_users():
     sb = sb_client()
-    resp = sb.table("users").select("cedula,full_name,role,is_active,created_at").order("created_at", desc=True).execute()
+    resp = sb.table("users").select(
+        "cedula,full_name,role,is_active,created_at"
+    ).order("created_at", desc=True).execute()
     return resp.data or []
 
 def upsert_stub(month: str, cedula: str, storage_path: str):
@@ -168,7 +215,9 @@ def get_stub_storage_path(month: str, cedula: str):
 
 def get_stubs_for_month(month: str):
     sb = sb_client()
-    resp = sb.table("stubs").select("month,cedula,storage_path,uploaded_at").eq("month", month).order("cedula", desc=False).execute()
+    resp = sb.table("stubs").select(
+        "month,cedula,storage_path,uploaded_at"
+    ).eq("month", month).order("cedula", desc=False).execute()
     return resp.data or []
 
 def count_users():
@@ -187,21 +236,33 @@ def count_stubs_month(month: str):
     return resp.count or 0
 
 
-# --- Storage ops
+# --- Storage ops (robusto con fallback update)
 def storage_upload_pdf(path: str, pdf_bytes: bytes, overwrite: bool = True):
-    """
-    Importante: el ejemplo oficial usa file-like object y file_options con upsert string. :contentReference[oaicite:2]{index=2}
-    """
     storage = sb_storage()
     f = io.BytesIO(pdf_bytes)
-    storage.upload(
+
+    # Intento 1: upload con upsert
+    try:
+        storage.upload(
+            path=path,
+            file=f,
+            file_options={
+                "content-type": "application/pdf",
+                "cache-control": "3600",
+                "upsert": "true" if overwrite else "false",
+            },
+        )
+        return
+    except Exception:
+        if not overwrite:
+            raise
+
+    # Intento 2: si existe, update
+    f2 = io.BytesIO(pdf_bytes)
+    storage.update(
         path=path,
-        file=f,
-        file_options={
-            "content-type": "application/pdf",
-            "cache-control": "3600",
-            "upsert": "true" if overwrite else "false",
-        },
+        file=f2,
+        file_options={"content-type": "application/pdf"},
     )
 
 def storage_download_pdf(path: str) -> bytes:
@@ -218,20 +279,6 @@ def storage_list_folder(prefix: str):
             "sortBy": {"column": "name", "order": "asc"},
         },
     )
-
-def storage_signed_url(path: str, expires_in: int = 3600, download: bool = True):
-    """
-    Crea URL firmado para bucket privado. :contentReference[oaicite:3]{index=3}
-    """
-    storage = sb_storage()
-    options = {"download": True} if download else {}
-    resp = storage.create_signed_url(path, expires_in, options if options else None)
-    # resp puede venir como dict (depende SDK); manejamos ambos
-    if isinstance(resp, dict) and "signedURL" in resp:
-        return resp["signedURL"]
-    if hasattr(resp, "get") and resp.get("signedURL"):
-        return resp.get("signedURL")
-    return None
 
 
 # =========================
@@ -315,12 +362,48 @@ def admin_home():
     col3.metric(f"Desprendibles ({month_sel})", f"{count_stubs_month(month_sel):,}")
 
     st.divider()
-    st.markdown("#### ¿Dónde se alojan los PDFs?")
+    st.markdown("#### Dónde quedan los PDFs")
     st.write(
-        f"- **Supabase Storage (bucket privado):** `{sb_bucket()}`\n"
-        f"- **Ruta estándar:** `YYYY-MM/<CEDULA>.pdf` (ej: `2025-11/1032456789.pdf`)\n"
-        "- **Metadatos en BD:** tabla `stubs` (mes, cédula, storage_path, fecha de carga)."
+        f"- Bucket: `{sb_bucket()}`\n"
+        f"- Ruta: `YYYY-MM/<CEDULA>.pdf` (ej: `2025-11/1032456789.pdf`)\n"
+        "- Metadatos: tabla `stubs`."
     )
+
+def admin_diagnostico():
+    st.subheader("Diagnóstico")
+    st.caption("Verifica que Supabase DB y Storage estén accesibles desde Streamlit Cloud.")
+
+    url_ok = bool(cfg_get("SUPABASE_URL"))
+    key_ok = bool(cfg_get("SUPABASE_SERVICE_ROLE_KEY"))
+    st.write("Secrets presentes:", {
+        "SUPABASE_URL": url_ok,
+        "SUPABASE_SERVICE_ROLE_KEY": key_ok,
+        "SUPABASE_BUCKET": bool(cfg_get("SUPABASE_BUCKET")),
+    })
+
+    st.divider()
+    try:
+        _ = sb_client()
+        st.success("Cliente Supabase: OK")
+    except Exception as e:
+        st.error(f"Cliente Supabase: ERROR -> {e}")
+        return
+
+    try:
+        # Prueba DB
+        _ = count_users()
+        st.success("Acceso DB (tabla users): OK (o tabla existe y es accesible)")
+    except Exception as e:
+        st.error(f"Acceso DB: ERROR -> {e}")
+
+    try:
+        # Prueba Storage: listar root del bucket (vacío o no)
+        _ = storage_list_folder("")
+        st.success("Acceso Storage (listar bucket): OK")
+    except Exception as e:
+        st.error(f"Acceso Storage: ERROR -> {e}")
+
+    st.info("Si DB falla: revisa que existan tablas `users` y `stubs`.\nSi Storage falla: revisa que exista el bucket y la key sea correcta.")
 
 def admin_users_panel():
     st.subheader("Usuarios")
@@ -346,14 +429,12 @@ def admin_users_panel():
                 st.error(f"No se pudo crear el usuario: {e}")
 
     st.divider()
-    st.markdown("#### Lista de usuarios")
     users = list_users()
     if not users:
         st.info("No hay usuarios.")
         return
 
-    df = pd.DataFrame(users)
-    df = df.rename(columns={
+    df = pd.DataFrame(users).rename(columns={
         "cedula": "Cédula",
         "full_name": "Nombre",
         "role": "Rol",
@@ -363,7 +444,6 @@ def admin_users_panel():
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("#### Acciones rápidas")
     col1, col2 = st.columns(2)
     with col1:
         target = st.text_input("Cédula a activar/desactivar")
@@ -412,63 +492,82 @@ def admin_upload_panel():
     overwrite = st.checkbox("Sobrescribir si ya existe (upsert)", value=True)
     auto_create_missing_users = st.checkbox("Crear usuario automáticamente si no existe (inactivo)", value=False)
     auto_create_name = st.text_input("Nombre por defecto (si se autocrea)", value="Usuario")
+
     st.info(
-        "Si una cédula NO existe en `users`, el registro en `stubs` no queda asociado y el usuario no podrá ver su PDF. "
-        "Esta pantalla te lo reporta y opcionalmente puede autocrear el usuario (inactivo) para que luego le asignes contraseña."
+        "Si una cédula NO existe en `users`, el usuario no podrá ver su PDF. "
+        "Aquí se reporta y opcionalmente se puede autocrear INACTIVO."
     )
 
-    st.divider()
     tab1, tab2 = st.tabs(["Subir ZIP", "Subir múltiples PDFs"])
 
-    def ensure_user(cedula: str):
+    def ensure_user(cedula: str) -> Tuple[bool, bool, Optional[str]]:
         u = get_user(cedula)
         if u:
-            return True, False, None  # exists, created, temp_pass
+            return True, False, None
         if not auto_create_missing_users:
             return False, False, None
-        temp_pass = secrets.token_urlsafe(10)
+        temp_pass = pysecrets.token_urlsafe(10)
         create_user(cedula, auto_create_name, temp_pass, role="user", is_active=False)
         return True, True, temp_pass
 
-    def run_upload(items: list[tuple[str, bytes]]):
-        results = []
+    def show_last_upload_results():
+        payload = st.session_state.get("last_upload_results")
+        if not payload:
+            return
+        st.markdown("### Resultado del último cargue")
+        st.caption(f"Mes: {payload['month']} | Fecha: {payload['timestamp']} | Bucket: {sb_bucket()}")
+
+        df = pd.DataFrame(payload["results"])
+        if not df.empty:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cargados", int((df["estado"] == "OK").sum()))
+            c2.metric("Omitidos", int((df["estado"] == "OMITIDO").sum()))
+            c3.metric("Errores", int((df["estado"] == "ERROR").sum()))
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if payload.get("created_users"):
+            st.warning("Se autocrearon usuarios INACTIVOS. Debes asignar contraseña y activarlos en 'Usuarios'.")
+            st.dataframe(pd.DataFrame(payload["created_users"]), use_container_width=True, hide_index=True)
+
+    def run_upload(items: List[Tuple[str, bytes]]):
+        results: List[Dict[str, Any]] = []
         total = len(items)
         if total == 0:
             st.warning("No se encontraron PDFs en el archivo.")
             return
 
-        progress = st.progress(0, text="Iniciando carga...")
         created_users = []
+        progress = st.progress(0, text="Iniciando...")
 
         with st.status("Procesando archivos...", expanded=True) as status:
             ok = skipped = errors = 0
+
             for i, (fname, fbytes) in enumerate(items, start=1):
                 cedula = extract_cedula_from_filename(fname)
                 size_kb = round(len(fbytes) / 1024, 1)
 
-                if not cedula:
-                    skipped += 1
-                    results.append({
-                        "archivo": fname, "cedula": None, "tam_kb": size_kb,
-                        "estado": "OMITIDO", "motivo": "No se pudo extraer cédula del nombre",
-                        "storage_path": None
-                    })
-                elif not is_pdf_bytes(fbytes):
-                    skipped += 1
-                    results.append({
-                        "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
-                        "estado": "OMITIDO", "motivo": "No parece ser PDF (%PDF- no encontrado)",
-                        "storage_path": None
-                    })
-                else:
-                    # Validar/crear usuario
-                    try:
+                try:
+                    if not cedula:
+                        skipped += 1
+                        results.append({
+                            "archivo": fname, "cedula": None, "tam_kb": size_kb,
+                            "estado": "OMITIDO", "motivo": "No se pudo extraer cédula del nombre",
+                            "storage_path": None
+                        })
+                    elif not is_pdf_bytes(fbytes):
+                        skipped += 1
+                        results.append({
+                            "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                            "estado": "OMITIDO", "motivo": "No parece ser PDF",
+                            "storage_path": None
+                        })
+                    else:
                         user_ok, created, temp_pass = ensure_user(cedula)
                         if not user_ok:
                             skipped += 1
                             results.append({
                                 "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
-                                "estado": "OMITIDO", "motivo": "No existe usuario (crea la cédula en Usuarios o habilita autocreación)",
+                                "estado": "OMITIDO", "motivo": "No existe usuario (crea la cédula o habilita autocreación)",
                                 "storage_path": None
                             })
                         else:
@@ -485,13 +584,13 @@ def admin_upload_panel():
                                 "estado": "OK", "motivo": "Cargado",
                                 "storage_path": storage_path
                             })
-                    except Exception as e:
-                        errors += 1
-                        results.append({
-                            "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
-                            "estado": "ERROR", "motivo": str(e),
-                            "storage_path": None
-                        })
+                except Exception as e:
+                    errors += 1
+                    results.append({
+                        "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                        "estado": "ERROR", "motivo": str(e),
+                        "storage_path": None
+                    })
 
                 progress.progress(int(i * 100 / total), text=f"Procesando {i}/{total}...")
 
@@ -505,48 +604,14 @@ def admin_upload_panel():
             "created_users": created_users,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         }
-
-        # Render inmediato
         show_last_upload_results()
 
-    def show_last_upload_results():
-        payload = st.session_state.get("last_upload_results")
-        if not payload:
-            return
-        st.markdown("### Resultado del último cargue")
-        st.caption(f"Mes: {payload['month']} | Fecha: {payload['timestamp']} | Bucket: {sb_bucket()}")
-
-        df = pd.DataFrame(payload["results"])
-        if not df.empty:
-            ok_count = int((df["estado"] == "OK").sum())
-            omit_count = int((df["estado"] == "OMITIDO").sum())
-            err_count = int((df["estado"] == "ERROR").sum())
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Cargados", ok_count)
-            c2.metric("Omitidos", omit_count)
-            c3.metric("Errores", err_count)
-
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-        if payload.get("created_users"):
-            st.warning("Se autocrearon usuarios INACTIVOS. Debes asignar contraseña y activarlos en 'Usuarios'.")
-            st.dataframe(pd.DataFrame(payload["created_users"]), use_container_width=True, hide_index=True)
-
-        st.info(
-            "Dónde quedó: en Supabase Storage dentro del bucket indicado, bajo la ruta `YYYY-MM/CEDULA.pdf`. "
-            "Puedes verificarlo en el Dashboard de Supabase → Storage → bucket → carpeta del mes."
-        )
-
-    # Mostrar resultados previos si existen (para que no desaparezcan con reruns)
     show_last_upload_results()
 
     with tab1:
         zip_file = st.file_uploader("ZIP con PDFs", type=["zip"], accept_multiple_files=False)
-        if zip_file:
-            st.write(f"Archivo recibido: {zip_file.name}")
         if st.button("Procesar ZIP", use_container_width=True, disabled=not zip_file):
-            zip_bytes = zip_file.read()
-            items = list(iter_zip_pdfs(zip_bytes))
+            items = list(iter_zip_pdfs(zip_file.read()))
             run_upload(items)
 
     with tab2:
@@ -568,49 +633,25 @@ def admin_auditoria():
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("#### Registros en BD (tabla stubs)")
+        st.markdown("#### Registros en BD (stubs)")
         rows = get_stubs_for_month(month)
         st.metric("Cantidad BD", f"{len(rows):,}")
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        else:
-            st.info("No hay registros en BD para ese mes.")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     with col2:
         st.markdown("#### Objetos en Storage (carpeta del mes)")
         try:
             objs = storage_list_folder(month)
-            # objs suele ser list[dict] con 'name', 'metadata', etc.
             st.metric("Cantidad Storage", f"{len(objs):,}")
             if objs:
-                df = pd.DataFrame([{"name": o.get("name")} | {
+                df = pd.DataFrame([{
+                    "name": o.get("name"),
                     "size": (o.get("metadata") or {}).get("size"),
-                    "mimetype": (o.get("metadata") or {}).get("mimetype")
+                    "mimetype": (o.get("metadata") or {}).get("mimetype"),
                 } for o in objs])
                 st.dataframe(df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No hay objetos en Storage para ese mes.")
         except Exception as e:
             st.error(f"No se pudo listar Storage: {e}")
-
-    st.divider()
-    st.markdown("#### Comparación rápida (BD vs Storage)")
-    try:
-        bd = set(r["storage_path"] for r in (get_stubs_for_month(month) or []))
-        objs = storage_list_folder(month)
-        stg = set(f"{month}/{o.get('name')}" for o in (objs or []) if o.get("name"))
-        solo_bd = sorted(bd - stg)
-        solo_stg = sorted(stg - bd)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.write("En BD pero no en Storage")
-            st.dataframe(pd.DataFrame({"storage_path": solo_bd}), use_container_width=True, hide_index=True)
-        with c2:
-            st.write("En Storage pero no en BD")
-            st.dataframe(pd.DataFrame({"storage_path": solo_stg}), use_container_width=True, hide_index=True)
-    except Exception:
-        pass
 
 
 # =========================
@@ -658,7 +699,7 @@ def user_portal():
 # SHELL
 # =========================
 def shell_header():
-    st.sidebar.markdown(f"### {APP_TITLE}")
+    st.sidebar.markdown(f"## {APP_TITLE}")
     u = st.session_state.user
     st.sidebar.caption(f"Sesión: {u['cedula']} ({u['role'].upper()})")
     if st.sidebar.button("Cerrar sesión", use_container_width=True):
@@ -666,7 +707,7 @@ def shell_header():
 
 def admin_shell():
     shell_header()
-    page = st.sidebar.radio("Menú", ["Inicio", "Cargar PDFs", "Usuarios", "Auditoría"], index=0)
+    page = st.sidebar.radio("Menú", ["Inicio", "Cargar PDFs", "Usuarios", "Auditoría", "Diagnóstico"], index=0)
 
     if page == "Inicio":
         admin_home()
@@ -676,6 +717,8 @@ def admin_shell():
         admin_users_panel()
     elif page == "Auditoría":
         admin_auditoria()
+    elif page == "Diagnóstico":
+        admin_diagnostico()
 
 def user_shell():
     shell_header()
@@ -688,17 +731,20 @@ def user_shell():
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-    # Valida secrets temprano
-    try:
-        _ = sb_client()
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    # Fuerza lectura de config (si falta, muestra pantalla guiada)
+    _ = sb_client()
 
     if "user" not in st.session_state:
         st.session_state.user = None
 
-    if not user_exists_admin():
+    # Si no hay admin, crea admin inicial
+    try:
+        has_admin = user_exists_admin()
+    except Exception as e:
+        st.error(f"No se pudo consultar la BD. Revisa Supabase tablas / keys. Detalle: {e}")
+        st.stop()
+
+    if not has_admin:
         initial_admin_setup()
         return
 
