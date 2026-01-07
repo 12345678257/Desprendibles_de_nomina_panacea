@@ -118,19 +118,24 @@ def cfg_get(key: str, default: str = "") -> str:
 
 def config_screen_and_stop():
     st.title(APP_TITLE)
-    st.error("Faltan credenciales de Supabase para iniciar la app.")
+    st.error("Faltan credenciales de Supabase para iniciar la aplicación.")
+
+    # Diagnóstico seguro (True/False)
+    try:
+        present = {
+            "SUPABASE_URL": bool(st.secrets.get("SUPABASE_URL", "").strip()),
+            "SUPABASE_SERVICE_ROLE_KEY": bool(st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()),
+            "SUPABASE_BUCKET": bool(st.secrets.get("SUPABASE_BUCKET", "").strip()),
+        }
+    except Exception as e:
+        present = {"error_leyendo_st_secrets": str(e)}
+
+    st.write("Diagnóstico (llegaron secrets?):", present)
 
     st.markdown("### Cómo solucionarlo (Streamlit Community Cloud)")
-    st.write("1) Abre tu app → Settings → Secrets")
-    st.write("2) Pega esto y guarda:")
-    st.code(
-        'SUPABASE_URL = "https://TU-PROYECTO.supabase.co"\n'
-        'SUPABASE_SERVICE_ROLE_KEY = "TU_SERVICE_ROLE_KEY"\n'
-        'SUPABASE_BUCKET = "desprendibles"\n',
-        language="toml"
-    )
-    st.info("Después usa Reboot app. No subas secrets.toml al repositorio.")
+    st.write("App → Settings → Secrets → pega tus valores reales y guarda (Save changes), luego Reboot app.")
     st.stop()
+
 
 
 # =========================
