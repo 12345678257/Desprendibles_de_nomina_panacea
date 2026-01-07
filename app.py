@@ -3,26 +3,25 @@ import re
 import io
 import base64
 import hmac
-import sqlite3
 import zipfile
+import secrets
 from datetime import datetime, date
-from pathlib import Path
 
+import pandas as pd
 import streamlit as st
+from supabase import create_client
+
 
 # =========================
 # CONFIG
 # =========================
 APP_TITLE = "Portal de Desprendibles"
-DB_PATH = Path("data") / "app.db"
-STORAGE_DIR = Path("data") / "pdfs"
 PBKDF2_ITERS = 200_000
-
-CEDULA_RE = re.compile(r"(\d{5,})")  # ajusta si necesitas mínimo diferente
+CEDULA_RE = re.compile(r"(\d{5,})")  # Ajusta si necesitas otra regla
 
 
 # =========================
-# SEGURIDAD (hash estándar sin dependencias)
+# PASSWORD HASH (PBKDF2)
 # =========================
 import hashlib
 
@@ -44,133 +43,7 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # =========================
-# DB
-# =========================
-def get_conn():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        cedula TEXT UNIQUE NOT NULL,
-        full_name TEXT,
-        password_hash TEXT NOT NULL,
-        role TEXT NOT NULL DEFAULT 'user', -- 'admin' | 'user'
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS stubs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        month TEXT NOT NULL,        -- 'YYYY-MM'
-        cedula TEXT NOT NULL,
-        file_path TEXT NOT NULL,    -- ruta en disco
-        uploaded_at TEXT NOT NULL,
-        UNIQUE(month, cedula),
-        FOREIGN KEY (cedula) REFERENCES users(cedula) ON UPDATE CASCADE
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-def user_exists_admin() -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1;")
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
-
-def create_user(cedula: str, full_name: str, password: str, role: str = "user", is_active: int = 1):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO users (cedula, full_name, password_hash, role, is_active, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (cedula, full_name, hash_password(password), role, is_active, datetime.now().isoformat(timespec="seconds")))
-    conn.commit()
-    conn.close()
-
-def set_user_password(cedula: str, new_password: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET password_hash=? WHERE cedula=?", (hash_password(new_password), cedula))
-    conn.commit()
-    conn.close()
-
-def set_user_active(cedula: str, is_active: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET is_active=? WHERE cedula=?", (is_active, cedula))
-    conn.commit()
-    conn.close()
-
-def get_user(cedula: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT cedula, full_name, password_hash, role, is_active FROM users WHERE cedula=?", (cedula,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "cedula": row[0],
-        "full_name": row[1],
-        "password_hash": row[2],
-        "role": row[3],
-        "is_active": int(row[4]),
-    }
-
-def list_users():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT cedula, full_name, role, is_active, created_at FROM users ORDER BY created_at DESC;")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def upsert_stub(month: str, cedula: str, file_path: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO stubs (month, cedula, file_path, uploaded_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(month, cedula) DO UPDATE SET
-            file_path=excluded.file_path,
-            uploaded_at=excluded.uploaded_at;
-    """, (month, cedula, file_path, datetime.now().isoformat(timespec="seconds")))
-    conn.commit()
-    conn.close()
-
-def list_months_for_cedula(cedula: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT month FROM stubs WHERE cedula=? ORDER BY month DESC;", (cedula,))
-    rows = cur.fetchall()
-    conn.close()
-    return [r[0] for r in rows]
-
-def get_stub_path(month: str, cedula: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT file_path FROM stubs WHERE month=? AND cedula=? LIMIT 1;", (month, cedula))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-# =========================
-# UTILIDADES
+# HELPERS
 # =========================
 def normalize_month_str(s: str) -> str | None:
     s = (s or "").strip()
@@ -185,55 +58,184 @@ def month_from_date(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 def extract_cedula_from_filename(name: str) -> str | None:
-    base = Path(name).stem
+    base = os.path.splitext(os.path.basename(name))[0]
     m = CEDULA_RE.search(base)
-    if not m:
-        return None
-    return m.group(1)
-
-def safe_write_bytes(target_path: Path, data: bytes):
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.with_suffix(target_path.suffix + ".tmp")
-    with open(tmp_path, "wb") as f:
-        f.write(data)
-    os.replace(tmp_path, target_path)
+    return m.group(1) if m else None
 
 def is_pdf_bytes(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 
-def embed_pdf_in_page(pdf_bytes: bytes, height: int = 700):
+def embed_pdf_in_page(pdf_bytes: bytes, height: int = 750):
     b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    pdf_display = f"""
-        <iframe
-            src="data:application/pdf;base64,{b64}"
-            width="100%"
-            height="{height}"
-            style="border: none;"
-        ></iframe>
+    html = f"""
+    <iframe
+        src="data:application/pdf;base64,{b64}"
+        width="100%"
+        height="{height}"
+        style="border:none;"
+    ></iframe>
     """
-    st.components.v1.html(pdf_display, height=height, scrolling=True)
+    st.components.v1.html(html, height=height, scrolling=True)
 
 def iter_zip_pdfs(zip_bytes: bytes):
     """
-    Retorna tuplas (filename, file_bytes) solo para PDFs.
-    Protege contra zip-slip.
+    Retorna (filename, file_bytes) solo PDFs.
+    Incluye protección básica zip-slip.
     """
     zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
     for info in zf.infolist():
         if info.is_dir():
             continue
-        # zip-slip guard
-        p = Path(info.filename)
-        if any(part == ".." for part in p.parts):
+        normalized = info.filename.replace("\\", "/")
+        if ".." in normalized.split("/"):
             continue
-        if not info.filename.lower().endswith(".pdf"):
+        if not normalized.lower().endswith(".pdf"):
             continue
         with zf.open(info, "r") as f:
             yield info.filename, f.read()
 
 
 # =========================
-# UI: AUTH
+# SUPABASE
+# =========================
+@st.cache_resource
+def sb_client():
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+    if not url or not key:
+        raise RuntimeError("Faltan SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY en Secrets.")
+    return create_client(url, key)
+
+def sb_bucket() -> str:
+    return st.secrets.get("SUPABASE_BUCKET", "desprendibles")
+
+def sb_storage():
+    return sb_client().storage.from_(sb_bucket())
+
+
+# --- DB ops
+def user_exists_admin() -> bool:
+    sb = sb_client()
+    resp = sb.table("users").select("cedula").eq("role", "admin").limit(1).execute()
+    return bool(resp.data)
+
+def get_user(cedula: str):
+    sb = sb_client()
+    resp = sb.table("users").select("cedula,full_name,password_hash,role,is_active").eq("cedula", cedula).limit(1).execute()
+    return resp.data[0] if resp.data else None
+
+def create_user(cedula: str, full_name: str, password: str, role: str = "user", is_active: bool = True):
+    sb = sb_client()
+    sb.table("users").insert({
+        "cedula": cedula,
+        "full_name": full_name,
+        "password_hash": hash_password(password),
+        "role": role,
+        "is_active": is_active
+    }).execute()
+
+def set_user_password(cedula: str, new_password: str):
+    sb = sb_client()
+    sb.table("users").update({"password_hash": hash_password(new_password)}).eq("cedula", cedula).execute()
+
+def set_user_active(cedula: str, is_active: bool):
+    sb = sb_client()
+    sb.table("users").update({"is_active": is_active}).eq("cedula", cedula).execute()
+
+def list_users():
+    sb = sb_client()
+    resp = sb.table("users").select("cedula,full_name,role,is_active,created_at").order("created_at", desc=True).execute()
+    return resp.data or []
+
+def upsert_stub(month: str, cedula: str, storage_path: str):
+    sb = sb_client()
+    sb.table("stubs").upsert({
+        "month": month,
+        "cedula": cedula,
+        "storage_path": storage_path,
+        "uploaded_at": datetime.now().isoformat(timespec="seconds")
+    }).execute()
+
+def list_months_for_cedula(cedula: str):
+    sb = sb_client()
+    resp = sb.table("stubs").select("month").eq("cedula", cedula).order("month", desc=True).execute()
+    return [r["month"] for r in (resp.data or [])]
+
+def get_stub_storage_path(month: str, cedula: str):
+    sb = sb_client()
+    resp = sb.table("stubs").select("storage_path").eq("month", month).eq("cedula", cedula).limit(1).execute()
+    return resp.data[0]["storage_path"] if resp.data else None
+
+def get_stubs_for_month(month: str):
+    sb = sb_client()
+    resp = sb.table("stubs").select("month,cedula,storage_path,uploaded_at").eq("month", month).order("cedula", desc=False).execute()
+    return resp.data or []
+
+def count_users():
+    sb = sb_client()
+    resp = sb.table("users").select("cedula", count="exact").execute()
+    return resp.count or 0
+
+def count_stubs():
+    sb = sb_client()
+    resp = sb.table("stubs").select("cedula", count="exact").execute()
+    return resp.count or 0
+
+def count_stubs_month(month: str):
+    sb = sb_client()
+    resp = sb.table("stubs").select("cedula", count="exact").eq("month", month).execute()
+    return resp.count or 0
+
+
+# --- Storage ops
+def storage_upload_pdf(path: str, pdf_bytes: bytes, overwrite: bool = True):
+    """
+    Importante: el ejemplo oficial usa file-like object y file_options con upsert string. :contentReference[oaicite:2]{index=2}
+    """
+    storage = sb_storage()
+    f = io.BytesIO(pdf_bytes)
+    storage.upload(
+        path=path,
+        file=f,
+        file_options={
+            "content-type": "application/pdf",
+            "cache-control": "3600",
+            "upsert": "true" if overwrite else "false",
+        },
+    )
+
+def storage_download_pdf(path: str) -> bytes:
+    storage = sb_storage()
+    return storage.download(path)
+
+def storage_list_folder(prefix: str):
+    storage = sb_storage()
+    return storage.list(
+        prefix,
+        {
+            "limit": 1000,
+            "offset": 0,
+            "sortBy": {"column": "name", "order": "asc"},
+        },
+    )
+
+def storage_signed_url(path: str, expires_in: int = 3600, download: bool = True):
+    """
+    Crea URL firmado para bucket privado. :contentReference[oaicite:3]{index=3}
+    """
+    storage = sb_storage()
+    options = {"download": True} if download else {}
+    resp = storage.create_signed_url(path, expires_in, options if options else None)
+    # resp puede venir como dict (depende SDK); manejamos ambos
+    if isinstance(resp, dict) and "signedURL" in resp:
+        return resp["signedURL"]
+    if hasattr(resp, "get") and resp.get("signedURL"):
+        return resp.get("signedURL")
+    return None
+
+
+# =========================
+# AUTH UI
 # =========================
 def do_logout():
     st.session_state.user = None
@@ -241,70 +243,87 @@ def do_logout():
 
 def login_screen():
     st.title(APP_TITLE)
-    st.subheader("Ingreso")
+    st.caption("Acceso seguro por cédula y contraseña.")
 
-    with st.form("login_form", clear_on_submit=False):
-        cedula = st.text_input("Cédula", placeholder="Ej: 1032456789").strip()
-        password = st.text_input("Contraseña", type="password")
-        submitted = st.form_submit_button("Ingresar")
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
+        with st.form("login_form", clear_on_submit=False):
+            cedula = st.text_input("Cédula", placeholder="Ej: 1032456789").strip()
+            password = st.text_input("Contraseña", type="password")
+            ok = st.form_submit_button("Ingresar", use_container_width=True)
 
-    if submitted:
-        u = get_user(cedula)
-        if not u:
-            st.error("Usuario o contraseña inválidos.")
-            return
-        if not u["is_active"]:
-            st.error("Usuario inactivo. Contacta al administrador.")
-            return
-        if not verify_password(password, u["password_hash"]):
-            st.error("Usuario o contraseña inválidos.")
-            return
+        if ok:
+            u = get_user(cedula)
+            if not u:
+                st.error("Usuario o contraseña inválidos.")
+                return
+            if not u.get("is_active", True):
+                st.error("Usuario inactivo. Contacta al administrador.")
+                return
+            if not verify_password(password, u["password_hash"]):
+                st.error("Usuario o contraseña inválidos.")
+                return
 
-        st.session_state.user = {
-            "cedula": u["cedula"],
-            "full_name": u["full_name"] or "",
-            "role": u["role"],
-        }
-        st.success("Ingreso exitoso.")
-        st.rerun()
-
+            st.session_state.user = {
+                "cedula": u["cedula"],
+                "full_name": u.get("full_name") or "",
+                "role": u.get("role") or "user",
+            }
+            st.success("Ingreso exitoso.")
+            st.rerun()
 
 def initial_admin_setup():
     st.title(APP_TITLE)
-    st.subheader("Configuración inicial (crear ADMIN)")
-
-    st.info(
-        "No existe un usuario administrador. Crea el primer ADMIN ahora.\n\n"
-        "Recomendación: usa una cédula/usuario de admin (por ejemplo 'admin') o tu cédula real."
-    )
+    st.subheader("Configuración inicial: crear ADMIN")
+    st.info("No existe un usuario administrador. Crea el primer ADMIN ahora.")
 
     with st.form("init_admin"):
         cedula = st.text_input("Usuario admin (cédula o 'admin')", value="admin").strip()
         full_name = st.text_input("Nombre completo", value="Administrador")
         p1 = st.text_input("Contraseña", type="password")
         p2 = st.text_input("Confirmar contraseña", type="password")
-        ok = st.form_submit_button("Crear ADMIN")
+        ok = st.form_submit_button("Crear ADMIN", use_container_width=True)
 
     if ok:
         if not cedula:
-            st.error("Debes ingresar un usuario (cédula).")
+            st.error("Debes ingresar un usuario.")
             return
-        if p1 != p2 or not p1:
+        if not p1 or p1 != p2:
             st.error("Las contraseñas no coinciden o están vacías.")
             return
         try:
-            create_user(cedula=cedula, full_name=full_name, password=p1, role="admin", is_active=1)
+            create_user(cedula, full_name, p1, role="admin", is_active=True)
             st.success("Administrador creado. Ya puedes iniciar sesión.")
             st.rerun()
-        except sqlite3.IntegrityError:
-            st.error("Ese usuario ya existe. Intenta con otro.")
+        except Exception as e:
+            st.error(f"No se pudo crear el admin: {e}")
 
 
 # =========================
-# UI: ADMIN
+# ADMIN UI
 # =========================
+def admin_home():
+    st.subheader("Resumen")
+    st.caption("Visibilidad rápida de usuarios y desprendibles cargados.")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Usuarios", f"{count_users():,}")
+    col2.metric("Desprendibles (total)", f"{count_stubs():,}")
+
+    month_sel = month_from_date(date.today())
+    month_sel = st.text_input("Mes para métricas (YYYY-MM)", value=month_sel)
+    month_sel = normalize_month_str(month_sel) or month_from_date(date.today())
+    col3.metric(f"Desprendibles ({month_sel})", f"{count_stubs_month(month_sel):,}")
+
+    st.divider()
+    st.markdown("#### ¿Dónde se alojan los PDFs?")
+    st.write(
+        f"- **Supabase Storage (bucket privado):** `{sb_bucket()}`\n"
+        f"- **Ruta estándar:** `YYYY-MM/<CEDULA>.pdf` (ej: `2025-11/1032456789.pdf`)\n"
+        "- **Metadatos en BD:** tabla `stubs` (mes, cédula, storage_path, fecha de carga)."
+    )
+
 def admin_users_panel():
-    st.markdown("### Usuarios")
+    st.subheader("Usuarios")
 
     with st.expander("Crear usuario", expanded=True):
         with st.form("create_user"):
@@ -313,202 +332,354 @@ def admin_users_panel():
             role = st.selectbox("Rol", ["user", "admin"], index=0)
             password = st.text_input("Contraseña inicial", type="password")
             active = st.checkbox("Activo", value=True)
-            ok = st.form_submit_button("Crear")
+            ok = st.form_submit_button("Crear", use_container_width=True)
 
         if ok:
             if not cedula or not password:
                 st.error("Cédula y contraseña son obligatorias.")
                 return
             try:
-                create_user(cedula, full_name, password, role=role, is_active=1 if active else 0)
+                create_user(cedula, full_name, password, role=role, is_active=active)
                 st.success("Usuario creado.")
                 st.rerun()
-            except sqlite3.IntegrityError:
-                st.error("La cédula ya existe.")
+            except Exception as e:
+                st.error(f"No se pudo crear el usuario: {e}")
 
-    with st.expander("Administrar usuarios (activar/desactivar, reset password)", expanded=False):
-        users = list_users()
-        if not users:
-            st.write("No hay usuarios.")
-            return
-
-        for cedula, full_name, role, is_active, created_at in users:
-            cols = st.columns([3, 3, 1.5, 1.5, 2])
-            cols[0].write(f"**{cedula}**")
-            cols[1].write(full_name or "")
-            cols[2].write(role)
-            cols[3].write("Activo" if is_active else "Inactivo")
-            with cols[4]:
-                c1, c2, c3 = st.columns(3)
-                if c1.button("ON" if not is_active else "OFF", key=f"toggle_{cedula}"):
-                    set_user_active(cedula, 1 if not is_active else 0)
-                    st.rerun()
-                if c2.button("Reset", key=f"reset_{cedula}"):
-                    st.session_state._reset_target = cedula
-                # evita borrar: mejor desactivar
-
-        target = st.session_state.get("_reset_target")
-        if target:
-            st.warning(f"Resetear contraseña de: {target}")
-            with st.form("reset_pass"):
-                np1 = st.text_input("Nueva contraseña", type="password")
-                np2 = st.text_input("Confirmar", type="password")
-                ok = st.form_submit_button("Confirmar reset")
-            if ok:
-                if not np1 or np1 != np2:
-                    st.error("Contraseñas vacías o no coinciden.")
-                else:
-                    set_user_password(target, np1)
-                    st.success("Contraseña actualizada.")
-                    st.session_state._reset_target = None
-                    st.rerun()
-
-
-def admin_upload_panel():
-    st.markdown("### Cargar desprendibles (PDF)")
-
-    st.info(
-        "Requisitos:\n"
-        "- Cada PDF debe estar nombrado como **CEDULA.pdf** (ej: 1032456789.pdf)\n"
-        "- Recomendado: subir un **ZIP** con todos los PDFs del mes."
-    )
-
-    # Mes
-    col1, col2 = st.columns([2, 3])
-    with col1:
-        d = st.date_input("Selecciona una fecha del mes a cargar", value=date.today())
-    month = month_from_date(d)
-
-    with col2:
-        month_override = st.text_input("Mes (opcional) en formato YYYY-MM", value=month)
-    month_norm = normalize_month_str(month_override)
-    if not month_norm:
-        st.error("Mes inválido. Usa formato YYYY-MM (ej: 2025-11).")
+    st.divider()
+    st.markdown("#### Lista de usuarios")
+    users = list_users()
+    if not users:
+        st.info("No hay usuarios.")
         return
 
-    tabs = st.tabs(["Subir ZIP (recomendado)", "Subir múltiples PDFs"])
-    with tabs[0]:
-        zip_file = st.file_uploader("ZIP con PDFs", type=["zip"], accept_multiple_files=False)
-        overwrite = st.checkbox("Sobrescribir si ya existe", value=True, key="ov_zip")
-
-        if zip_file and st.button("Procesar ZIP"):
-            zip_bytes = zip_file.read()
-            processed = 0
-            skipped = 0
-            errors = 0
-
-            for fname, fbytes in iter_zip_pdfs(zip_bytes):
-                cedula = extract_cedula_from_filename(fname)
-                if not cedula:
-                    skipped += 1
-                    continue
-                if not is_pdf_bytes(fbytes):
-                    skipped += 1
-                    continue
-
-                target = STORAGE_DIR / month_norm / f"{cedula}.pdf"
-                if target.exists() and not overwrite:
-                    skipped += 1
-                    continue
-
-                try:
-                    safe_write_bytes(target, fbytes)
-                    upsert_stub(month_norm, cedula, str(target))
-                    processed += 1
-                except Exception:
-                    errors += 1
-
-            st.success(f"Listo. Procesados: {processed} | Omitidos: {skipped} | Errores: {errors}")
-
-    with tabs[1]:
-        pdfs = st.file_uploader("Selecciona PDFs", type=["pdf"], accept_multiple_files=True)
-        overwrite2 = st.checkbox("Sobrescribir si ya existe", value=True, key="ov_pdfs")
-
-        if pdfs and st.button("Procesar PDFs"):
-            processed = 0
-            skipped = 0
-            errors = 0
-
-            for up in pdfs:
-                cedula = extract_cedula_from_filename(up.name)
-                if not cedula:
-                    skipped += 1
-                    continue
-
-                fbytes = up.read()
-                if not is_pdf_bytes(fbytes):
-                    skipped += 1
-                    continue
-
-                target = STORAGE_DIR / month_norm / f"{cedula}.pdf"
-                if target.exists() and not overwrite2:
-                    skipped += 1
-                    continue
-
-                try:
-                    safe_write_bytes(target, fbytes)
-                    upsert_stub(month_norm, cedula, str(target))
-                    processed += 1
-                except Exception:
-                    errors += 1
-
-            st.success(f"Listo. Procesados: {processed} | Omitidos: {skipped} | Errores: {errors}")
-
-
-def admin_dashboard():
-    st.title(APP_TITLE)
-    st.write(f"Sesión: **{st.session_state.user['cedula']}** (ADMIN)")
-
-    if st.button("Cerrar sesión"):
-        do_logout()
+    df = pd.DataFrame(users)
+    df = df.rename(columns={
+        "cedula": "Cédula",
+        "full_name": "Nombre",
+        "role": "Rol",
+        "is_active": "Activo",
+        "created_at": "Creado",
+    })
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
-    menu = st.sidebar.radio("Administración", ["Usuarios", "Cargar PDFs"])
-    if menu == "Usuarios":
-        admin_users_panel()
-    else:
-        admin_upload_panel()
+    st.markdown("#### Acciones rápidas")
+    col1, col2 = st.columns(2)
+    with col1:
+        target = st.text_input("Cédula a activar/desactivar")
+        if st.button("Toggle Activo", use_container_width=True, disabled=not target.strip()):
+            u = get_user(target.strip())
+            if not u:
+                st.error("No existe ese usuario.")
+            else:
+                set_user_active(target.strip(), not bool(u.get("is_active", True)))
+                st.success("Actualizado.")
+                st.rerun()
+
+    with col2:
+        target2 = st.text_input("Cédula para resetear contraseña", key="rst2")
+        np1 = st.text_input("Nueva contraseña", type="password")
+        np2 = st.text_input("Confirmar", type="password")
+        if st.button("Reset contraseña", use_container_width=True, disabled=not target2.strip()):
+            if not np1 or np1 != np2:
+                st.error("Contraseñas vacías o no coinciden.")
+            else:
+                u = get_user(target2.strip())
+                if not u:
+                    st.error("No existe ese usuario.")
+                else:
+                    set_user_password(target2.strip(), np1)
+                    st.success("Contraseña actualizada.")
+                    st.rerun()
+
+def admin_upload_panel():
+    st.subheader("Cargar desprendibles (PDF)")
+    st.caption("Sube un ZIP con PDFs nombrados por cédula. Verás un reporte detallado de lo cargado.")
+
+    col1, col2 = st.columns([2, 3])
+    with col1:
+        d = st.date_input("Selecciona una fecha del mes", value=date.today())
+    default_month = month_from_date(d)
+
+    with col2:
+        month_override = st.text_input("Mes (YYYY-MM)", value=default_month)
+
+    month = normalize_month_str(month_override)
+    if not month:
+        st.error("Mes inválido. Usa YYYY-MM (ej: 2025-11).")
+        return
+
+    overwrite = st.checkbox("Sobrescribir si ya existe (upsert)", value=True)
+    auto_create_missing_users = st.checkbox("Crear usuario automáticamente si no existe (inactivo)", value=False)
+    auto_create_name = st.text_input("Nombre por defecto (si se autocrea)", value="Usuario")
+    st.info(
+        "Si una cédula NO existe en `users`, el registro en `stubs` no queda asociado y el usuario no podrá ver su PDF. "
+        "Esta pantalla te lo reporta y opcionalmente puede autocrear el usuario (inactivo) para que luego le asignes contraseña."
+    )
+
+    st.divider()
+    tab1, tab2 = st.tabs(["Subir ZIP", "Subir múltiples PDFs"])
+
+    def ensure_user(cedula: str):
+        u = get_user(cedula)
+        if u:
+            return True, False, None  # exists, created, temp_pass
+        if not auto_create_missing_users:
+            return False, False, None
+        temp_pass = secrets.token_urlsafe(10)
+        create_user(cedula, auto_create_name, temp_pass, role="user", is_active=False)
+        return True, True, temp_pass
+
+    def run_upload(items: list[tuple[str, bytes]]):
+        results = []
+        total = len(items)
+        if total == 0:
+            st.warning("No se encontraron PDFs en el archivo.")
+            return
+
+        progress = st.progress(0, text="Iniciando carga...")
+        created_users = []
+
+        with st.status("Procesando archivos...", expanded=True) as status:
+            ok = skipped = errors = 0
+            for i, (fname, fbytes) in enumerate(items, start=1):
+                cedula = extract_cedula_from_filename(fname)
+                size_kb = round(len(fbytes) / 1024, 1)
+
+                if not cedula:
+                    skipped += 1
+                    results.append({
+                        "archivo": fname, "cedula": None, "tam_kb": size_kb,
+                        "estado": "OMITIDO", "motivo": "No se pudo extraer cédula del nombre",
+                        "storage_path": None
+                    })
+                elif not is_pdf_bytes(fbytes):
+                    skipped += 1
+                    results.append({
+                        "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                        "estado": "OMITIDO", "motivo": "No parece ser PDF (%PDF- no encontrado)",
+                        "storage_path": None
+                    })
+                else:
+                    # Validar/crear usuario
+                    try:
+                        user_ok, created, temp_pass = ensure_user(cedula)
+                        if not user_ok:
+                            skipped += 1
+                            results.append({
+                                "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                                "estado": "OMITIDO", "motivo": "No existe usuario (crea la cédula en Usuarios o habilita autocreación)",
+                                "storage_path": None
+                            })
+                        else:
+                            if created:
+                                created_users.append({"cedula": cedula, "temp_password": temp_pass})
+
+                            storage_path = f"{month}/{cedula}.pdf"
+                            storage_upload_pdf(storage_path, fbytes, overwrite=overwrite)
+                            upsert_stub(month, cedula, storage_path)
+
+                            ok += 1
+                            results.append({
+                                "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                                "estado": "OK", "motivo": "Cargado",
+                                "storage_path": storage_path
+                            })
+                    except Exception as e:
+                        errors += 1
+                        results.append({
+                            "archivo": fname, "cedula": cedula, "tam_kb": size_kb,
+                            "estado": "ERROR", "motivo": str(e),
+                            "storage_path": None
+                        })
+
+                progress.progress(int(i * 100 / total), text=f"Procesando {i}/{total}...")
+
+            status.update(label=f"Finalizado. OK={ok}, Omitidos={skipped}, Errores={errors}", state="complete")
+
+        progress.empty()
+
+        st.session_state["last_upload_results"] = {
+            "month": month,
+            "results": results,
+            "created_users": created_users,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        # Render inmediato
+        show_last_upload_results()
+
+    def show_last_upload_results():
+        payload = st.session_state.get("last_upload_results")
+        if not payload:
+            return
+        st.markdown("### Resultado del último cargue")
+        st.caption(f"Mes: {payload['month']} | Fecha: {payload['timestamp']} | Bucket: {sb_bucket()}")
+
+        df = pd.DataFrame(payload["results"])
+        if not df.empty:
+            ok_count = int((df["estado"] == "OK").sum())
+            omit_count = int((df["estado"] == "OMITIDO").sum())
+            err_count = int((df["estado"] == "ERROR").sum())
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cargados", ok_count)
+            c2.metric("Omitidos", omit_count)
+            c3.metric("Errores", err_count)
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+        if payload.get("created_users"):
+            st.warning("Se autocrearon usuarios INACTIVOS. Debes asignar contraseña y activarlos en 'Usuarios'.")
+            st.dataframe(pd.DataFrame(payload["created_users"]), use_container_width=True, hide_index=True)
+
+        st.info(
+            "Dónde quedó: en Supabase Storage dentro del bucket indicado, bajo la ruta `YYYY-MM/CEDULA.pdf`. "
+            "Puedes verificarlo en el Dashboard de Supabase → Storage → bucket → carpeta del mes."
+        )
+
+    # Mostrar resultados previos si existen (para que no desaparezcan con reruns)
+    show_last_upload_results()
+
+    with tab1:
+        zip_file = st.file_uploader("ZIP con PDFs", type=["zip"], accept_multiple_files=False)
+        if zip_file:
+            st.write(f"Archivo recibido: {zip_file.name}")
+        if st.button("Procesar ZIP", use_container_width=True, disabled=not zip_file):
+            zip_bytes = zip_file.read()
+            items = list(iter_zip_pdfs(zip_bytes))
+            run_upload(items)
+
+    with tab2:
+        pdfs = st.file_uploader("Selecciona PDFs", type=["pdf"], accept_multiple_files=True)
+        if st.button("Procesar PDFs", use_container_width=True, disabled=not pdfs):
+            items = [(p.name, p.read()) for p in pdfs]
+            run_upload(items)
+
+def admin_auditoria():
+    st.subheader("Auditoría")
+    st.caption("Revisa qué quedó en BD y qué existe en Storage para un mes.")
+
+    default_month = month_from_date(date.today())
+    month = st.text_input("Mes a auditar (YYYY-MM)", value=default_month)
+    month = normalize_month_str(month)
+    if not month:
+        st.error("Mes inválido.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Registros en BD (tabla stubs)")
+        rows = get_stubs_for_month(month)
+        st.metric("Cantidad BD", f"{len(rows):,}")
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No hay registros en BD para ese mes.")
+
+    with col2:
+        st.markdown("#### Objetos en Storage (carpeta del mes)")
+        try:
+            objs = storage_list_folder(month)
+            # objs suele ser list[dict] con 'name', 'metadata', etc.
+            st.metric("Cantidad Storage", f"{len(objs):,}")
+            if objs:
+                df = pd.DataFrame([{"name": o.get("name")} | {
+                    "size": (o.get("metadata") or {}).get("size"),
+                    "mimetype": (o.get("metadata") or {}).get("mimetype")
+                } for o in objs])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No hay objetos en Storage para ese mes.")
+        except Exception as e:
+            st.error(f"No se pudo listar Storage: {e}")
+
+    st.divider()
+    st.markdown("#### Comparación rápida (BD vs Storage)")
+    try:
+        bd = set(r["storage_path"] for r in (get_stubs_for_month(month) or []))
+        objs = storage_list_folder(month)
+        stg = set(f"{month}/{o.get('name')}" for o in (objs or []) if o.get("name"))
+        solo_bd = sorted(bd - stg)
+        solo_stg = sorted(stg - bd)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.write("En BD pero no en Storage")
+            st.dataframe(pd.DataFrame({"storage_path": solo_bd}), use_container_width=True, hide_index=True)
+        with c2:
+            st.write("En Storage pero no en BD")
+            st.dataframe(pd.DataFrame({"storage_path": solo_stg}), use_container_width=True, hide_index=True)
+    except Exception:
+        pass
 
 
 # =========================
-# UI: USER
+# USER UI
 # =========================
 def user_portal():
-    st.title(APP_TITLE)
+    st.subheader("Mis desprendibles")
     cedula = st.session_state.user["cedula"]
     full_name = st.session_state.user.get("full_name", "")
+    st.caption(f"Usuario: {full_name or cedula}")
 
-    st.write(f"Bienvenido: **{full_name or cedula}**")
-    if st.button("Cerrar sesión"):
-        do_logout()
-
-    st.divider()
     months = list_months_for_cedula(cedula)
     if not months:
         st.info("Aún no hay desprendibles disponibles para tu usuario.")
         return
 
-    month = st.selectbox("Selecciona el mes", months)
-    path = get_stub_path(month, cedula)
-    if not path or not Path(path).exists():
-        st.error("El archivo no se encuentra en el servidor. Contacta al administrador.")
+    month = st.selectbox("Mes", months)
+    storage_path = get_stub_storage_path(month, cedula)
+    if not storage_path:
+        st.error("No se encuentra el registro. Contacta al administrador.")
         return
 
-    pdf_bytes = Path(path).read_bytes()
+    try:
+        pdf_bytes = storage_download_pdf(storage_path)
+    except Exception as e:
+        st.error(f"No se pudo descargar el PDF: {e}")
+        return
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        st.markdown(f"#### Desprendible {month}")
+        st.markdown(f"### Desprendible {month}")
     with c2:
         st.download_button(
             "Descargar PDF",
             data=pdf_bytes,
             file_name=f"{cedula}_{month}.pdf",
             mime="application/pdf",
-            use_container_width=True
+            use_container_width=True,
         )
 
-    embed_pdf_in_page(pdf_bytes, height=750)
+    embed_pdf_in_page(pdf_bytes, height=780)
+
+
+# =========================
+# SHELL
+# =========================
+def shell_header():
+    st.sidebar.markdown(f"### {APP_TITLE}")
+    u = st.session_state.user
+    st.sidebar.caption(f"Sesión: {u['cedula']} ({u['role'].upper()})")
+    if st.sidebar.button("Cerrar sesión", use_container_width=True):
+        do_logout()
+
+def admin_shell():
+    shell_header()
+    page = st.sidebar.radio("Menú", ["Inicio", "Cargar PDFs", "Usuarios", "Auditoría"], index=0)
+
+    if page == "Inicio":
+        admin_home()
+    elif page == "Cargar PDFs":
+        admin_upload_panel()
+    elif page == "Usuarios":
+        admin_users_panel()
+    elif page == "Auditoría":
+        admin_auditoria()
+
+def user_shell():
+    shell_header()
+    user_portal()
 
 
 # =========================
@@ -516,26 +687,30 @@ def user_portal():
 # =========================
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
-    init_db()
+
+    # Valida secrets temprano
+    try:
+        _ = sb_client()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
     if "user" not in st.session_state:
         st.session_state.user = None
 
-    # Setup inicial (primer admin)
     if not user_exists_admin():
         initial_admin_setup()
         return
 
-    # Login si no hay sesión
     if not st.session_state.user:
         login_screen()
         return
 
-    role = st.session_state.user.get("role")
+    role = st.session_state.user.get("role", "user")
     if role == "admin":
-        admin_dashboard()
+        admin_shell()
     else:
-        user_portal()
+        user_shell()
 
 
 if __name__ == "__main__":
